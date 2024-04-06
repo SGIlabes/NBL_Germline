@@ -1,0 +1,598 @@
+---
+title: "Germline Functional Variants Contribute to Somatic Mutation and Outcomes in Neuroblastoma"
+output: html_document
+---
+# 1. Library
+```{r setup, include=FALSE}
+library(tidyverse)
+
+package_list <- c("readr", 'tidyverse',"tibble", "openxlsx", "readxl", 
+                  "writexl", "stringr", "naniar", "MASS", "devtools", 
+                  "ggvenn", "cowplot", "ggpubr", "survival", "survminer",
+                  "hrbrthemes", "viridis", "RColorBrewer", "scales", "psych")
+
+walk(package_list, library, character.only = TRUE)
+
+
+```
+
+#2. Germline Variant filter (QC/Genomic Region)
+```{r pressure, echo=FALSE}
+library(tidyverse)
+library(stringr)
+
+allfilelist <- list.files(path = "/path/data/" ,
+                          pattern = "germline", recursive = TRUE, full.names = TRUE)
+
+
+process_file <- function(filepath) {
+  read.delim(filepath) %>%
+    mutate(patient_id = str_extract(filepath, "D\\d+(?=_germline)")) %>%
+    filter(Chr != "chrY", DP >= 10, GQ >= 50, VAF >= 0.3, FILTER == "PASS") %>% # SMC
+    #filter(Chr != "chrY", DP >= 15, GQ >= 50, VAF >= 0.2, FILTER == "PASS") %>% # TARGET
+    filter(str_detect(Func, "exonic") | str_detect(Func, "splicing"))
+}
+
+raw_variant <- map_dfr(allfilelist, process_file) %>% bind_rows()
+
+
+```
+
+#3. Germline Variant filter (Rare/Functional)
+```{r}
+raw_variant_smc <- raw_variant %>%
+  filter(KRGDB_1100 < 0.01 | is.na(KRGDB_1100)) %>%
+  filter(ExAC_ALL < 0.01 | is.na(ExAC_ALL)) %>%
+  filter(!str_detect(ExonicFunc, "nonframeshift")) %>%
+  filter(REVEL >= 0.7 | str_detect(CLNINSIG, "Pathogenic|Likely") |
+           str_detect(ExonicFunc, "frameshift") | str_detect(ExonicFunc, "splicing")) %>%
+  filter(!str_detect(CLNINSIG, "benign|Benign") | is.na(CLNINSIG)) %>%
+  distinct(patient_id, Gene, Exon, .keep_all = TRUE) %>%
+  left_join(raw_variant %>%
+              group_by(Gene, ExonicFunc, GenbankID, Nucleotide) %>%
+              summarise(counts_dup = n(), .groups = 'drop') %>%
+              mutate(counts_dup = as.numeric(counts_dup)),
+            by = c("Gene", "ExonicFunc", "GenbankID", "Nucleotide")) %>%
+  mutate(unique_ids = n_distinct(patient_id)) %>%
+  # filter(counts_dup < unique_ids * 0.1) %>%
+  filter(counts_dup < 12.5)
+
+filtered_variant_target <- raw_variant_target %>%
+  mutate(ExAC_Filtered = case_when(
+    Estimated_population == 'EUR' ~ ifelse(ExAC_ALL < 0.01 | is.na(ExAC_ALL), TRUE, FALSE),
+    Estimated_population == 'AFR' ~ ifelse(ExAC_AFR < 0.01 | is.na(ExAC_AFR), TRUE, FALSE),
+    Estimated_population == 'EAS' ~ ifelse(ExAC_EAS < 0.01 | is.na(ExAC_EAS), TRUE, FALSE),
+    Estimated_population == 'SAS' ~ ifelse(ExAC_SAS < 0.01 | is.na(ExAC_SAS), TRUE, FALSE),
+    Estimated_population == 'AMR' ~ ifelse(ExAC_AMR < 0.01 | is.na(ExAC_AMR), TRUE, FALSE),
+    TRUE ~ FALSE 
+  )) %>%
+  filter(ExAC_Filtered) 
+
+
+filtered_variant_target <- filtered_variant_target %>%
+  filter(!str_detect(ExonicFunc, "nonframeshift")) %>%
+  filter(REVEL >= 0.7 | str_detect(CLNINSIG, "Pathogenic|Likely") |
+           str_detect(ExonicFunc, "frameshift") | str_detect(ExonicFunc, "splicing")) %>%
+  filter(!str_detect(CLNINSIG, "benign|Benign") | is.na(CLNINSIG)) %>%
+  distinct(patient_id, Gene, Exon, .keep_all = TRUE) %>%
+  left_join(rawvariant %>%
+              group_by(Gene, ExonicFunc, GenbankID, Nucleotide) %>%
+              summarise(counts_dup = n(), .groups = 'drop') %>%
+              mutate(counts_dup = as.numeric(counts_dup)),
+            by = c("Gene", "ExonicFunc", "GenbankID", "Nucleotide")) %>%
+  mutate(unique_ids = n_distinct(patient_id)) %>%
+  filter(counts_dup < unique_ids * 0.1) %>%
+  select(counts_dup, everything()) 
+
+```
+
+#4. CPGs
+```{r}
+cosmic<-read_csv("/path/data/ref/cancer_gene_census.csv")
+cosmic<-cosmic %>% filter(Germline=="yes")
+cosmic_TSG_Onco<- cosmic %>% filter(str_detect(Role,'TSG|suppresses|oncogene'))
+cosmic_TSG<-cosmic_TSG %>% filter(!str_detect(Role,'onco'))
+cosmic_CPG<-cosmic %>% filter(Germline=="yes")
+
+missense<-filtered_variant %>% filter(ExonicFunc=="nonsynonymous SNV") %>% filter(Gene %in% cosmic_TSG_onco$Gene)
+PTV<-filtered_variant %>% filter(ExonicFunc!="nonsynonymous SNV") %>% filter(Gene %in% cosmic_TSG_Only$Gene) 
+CPG_variant<-rbind(missense,PTV)
+
+CPG_count<-table(CPG_variant$germline_id)
+CPG_count<-data.frame(CPG_count)
+names(CPG_count)<-c("germline_id","cosmic_burden")
+
+clinical_data<- left_join(clinical_data,cosmic_burden,by=c("germline_id"))
+clinical_data <- mutate_at(clinical_data, "cosmic_burden", ~replace(., is.na(.), 0))
+
+clinical_data$cosmic_burden<-as.numeric(clinical_data$cosmic_burden)
+clinical_data<-clinical_data %>% mutate(CPG=ifelse(cosmic_burden>0,"Yes","No"))
+
+```
+
+# 5. Somatic Data
+```{r}
+somatic_mafs=list.files(path = "/path/data/somatic/VEP/", pattern = "merged", full.names = TRUE)
+merge_somatic=merge_mafs(mafs=somatic_mafs)
+variant_per_sample<-merge_somatic@variants.per.sample
+
+
+merge_somatic_qc<-merge_somatic
+merge_data<-merge_somatic_qc@data 
+merge_data<-merge_data %>% filter(t_depth>=30 & t_alt_count>2)
+merge_data<-merge_data %>% filter(t_alt_count/t_depth>0.05)
+merge_data<-merge_data %>% filter(is.na(gnomAD_AF)|gnomAD_AF<0.001)
+
+# Only for TARGET (remove Oxo)
+# merge_data2<-merge_data %>%
+#   filter(ifelse(Reference_Allele=="G"&Tumor_Seq_Allele2 %in% c("T"), t_alt_count/t_depth>=0.15, t_alt_count/t_depth>0.05)) %>%
+#   filter(ifelse(Reference_Allele=="C"&Tumor_Seq_Allele2 %in% c("A"), t_alt_count/t_depth>=0.15, t_alt_count/t_depth>0.05))
+                                  
+                                  
+
+
+somatic_syn<-merge_somatic_qc@maf.silent 
+
+somatic_syn<-somatic_syn %>% filter(t_depth>=30 & t_alt_count>2) 
+somatic_syn<-somatic_syn %>% filter(t_alt_count/t_depth>0.05) 
+
+somatic_syn<-somatic_syn %>% filter(is.na(gnomAD_AF)|gnomAD_AF<0.001) #97815
+
+# Only for TARGET (remove Oxo)
+# somatic_syn<-somatic_syn %>%
+#   filter(ifelse(Reference_Allele=="G"&Tumor_Seq_Allele2 %in% c("T"), t_alt_count/t_depth>=0.15, t_alt_count/t_depth>0.05)) %>%
+#   filter(ifelse(Reference_Allele=="C"&Tumor_Seq_Allele2 %in% c("A"), t_alt_count/t_depth>=0.15, t_alt_count/t_depth>0.05))
+
+
+
+all_data<-rbind(merge_data,somatic_syn)
+somatic.maf<-read.maf(maf =all_data)
+
+TMB.data <- reshape2::melt(as.data.frame(getSampleSummary(somatic.maf))) %>%
+  dplyr::mutate(Tumor_Sample_Barcode = factor(Tumor_Sample_Barcode, levels=getSampleSummary(somatic.maf)[[1]])) 
+
+TMB_total<-TMB.data %>% filter(variable=="total")
+TMB_total<-TMB_total[,c("Tumor_Sample_Barcode","value")]
+colnames(TMB_total)<-c("Tumor_Sample_Barcode","TMB")
+```
+
+# 6. Correlation
+```{r}
+
+library(smplot2)
+shapiro.test(data$germ_rare_burden)
+shapiro.test(data$TMB)
+shapiro.test(data$TMB_log)
+
+
+TMB_burden<-ggscatter(SMC_clinic, x = "germ_rare_burden", y = "TMB_log",
+          add = "reg.line",                                 # Add regression line
+          conf.int = TRUE,
+          size=2,                                  # Add confidence interval
+          add.params = list(color = "black",
+                            fill = "lightgray"),
+          rug=FALSE,
+          fill= sm_color("skyblue"),shape=21,color=sm_color("blue"),stroke=0.5,
+          xlab="Germline variant burden of pFGVs",alpha=1
+          )+stat_cor(method = "pearson",p.accuracy = 0.001, r.accuracy = 0.01,cor.coef.name='r',
+                     aes(label = paste(..r.label.., gsub("p", "P", ..p.label..), sep = "~`,`~")))+ sm_hgrid()+
+   ylab(expression("Somatic mutational burden (log"[10]*" scale)"))
+TMB_burden
+
+TMB_burden_histogram<-ggExtra::ggMarginal(TMB_burden, type = "histogram",fill="#CDCDCD")
+                                        
+pdf(paste0(result_dir, "/SMC_TMB_burden_histogram.pdf"), width=4, height=4)
+TMB_burden_histogram
+dev.off()
+```
+
+# 7. Box Compare
+```{r}
+summary(data$germ_rare_burden)
+my_comparisons=list(c("Low","High"))
+data$germ_burden_group<-factor(data$germ_burden_group,levels=c("Low","High"))
+
+GVB_TMB_Box<-data %>% 
+  ggplot(aes(x=germ_burden_group, fill= germ_burden_group, y=TMB))+
+  geom_point(position=position_jitterdodge(),
+             color="black",
+             shape=21,
+             stroke=0.5)+
+  geom_boxplot(show.legend = FALSE,outlier.shape = NA,alpha=c(0.7,0.7),width=0.5) +
+  scale_fill_manual(values = sm_color("brown","blue"))+
+  ggpubr::stat_compare_means(method = "t.test",
+                             label.y=75,comparisons = my_comparisons) +
+  xlab("Germline variant burden of pFGVs")+
+  ylab("Somatic mutational burden")+theme(
+              panel.background = element_blank(),
+              axis.title = element_text(face="bold"),
+              axis.text.x = element_text(face="bold",color = "black"),
+              axis.line = element_line(linewidth =0.5, colour = "black"),
+              legend.position="none")+sm_hgrid()+
+  scale_x_discrete(labels=c('Low', 'High'))
+c("#B0996B","#0E7AB0")
+pdf(paste0(result_dir, "/SMC_TMB_GVB_box.pdf"), width=4, height=4)
+GVB_TMB_Box
+dev.off()   
+```
+
+# 8. Synonymous 
+```{r}
+germ_syn<-read_tsv("/path/data/germline/synonymous_variant_filtered.tsv") #40517
+nrow(distinct(germ_syn,germline_id))
+
+germ_syn_burden<-table(germ_syn$germline_id)
+germ_syn_burden<-data.frame(germ_syn_burden)
+
+names(germ_syn_burden)<-c("germline_id","germ_syn_burden")
+
+
+downsampling_rates <- seq(0.1, 1, by=0.01)
+
+bootstrapped_results <- map_dfr(downsampling_rates, function(frac) {
+  downsampled_data <- germ_syn %>%
+  group_by(germline_id) %>%
+  sample_frac(frac) %>%
+  ungroup()
+  downsampled_burden <- table(downsampled_data$germline_id)
+  downsampled_burden <- data.frame(downsampled_burden)
+  names(downsampled_burden) <- c("germline_id", "germ_syn_downburden")
+  
+  SMC_down <- left_join(SMC_clinic, downsampled_burden, by=c("germline_id"))
+  
+  cor_result <- cor.test(SMC_down$germ_syn_downburden, SMC_down$TMB_log, method="pearson")
+  return(data.frame(downsample_rate = frac, cor_coefficient = cor_result$estimate, p_value = cor_result$p.value))
+})
+
+bootstrapped_results
+
+```
+
+# 9. Ethnicity
+
+```{r}
+
+library(EthSEQ)
+
+
+ethseq.Analysis(
+  target.vcf = "/path/data/germline/smc_merged_h19.vcf",
+  model.available = "Gencode.Exome",  
+  model.assembly = "hg19",
+  model.pop = "All",
+  out.dir = file.path(tempdir(),"EthSEQ_Analysis/"),
+  verbose=TRUE,
+  cores =7,
+  composite.model.call.rate = 0.98,
+  space = "3D")
+
+ethseq.annotations <- read.delim(file.path(tempdir(), "EthSEQ_Analysis/Report.txt"),
+                                 sep = "\t", as.is = TRUE, header = TRUE)
+
+
+```
+
+# 10. GVB clinic
+```{r}
+Risk_figure <- ggplot(data = data_smc, mapping = aes(x = Risk, y = germ_rare_burden, color = Risk)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,)+ylab("Germline variant burden")+
+  scale_color_manual(values = sm_palette(3))+scale_x_discrete(labels=c("Non-high risk",'High risk'))
+
+stat.test2 <- compare_means(
+ germ_rare_burden ~ Stage, data = data_smc,
+ method = "t.test"
+)
+
+Stage_figure <- ggplot(data = data_smc, mapping = aes(x = Stage, y = germ_rare_burden, color = Stage)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test2,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,) +ylab("Germline variant burden")+
+  scale_color_manual(values = sm_palette(3))
+
+stat.test3 <- compare_means(
+ germ_rare_burden ~ Age2, data = data_smc,
+ method = "t.test"
+)
+
+Age_figure <- ggplot(data = data_smc, mapping = aes(x = Age2, y = germ_rare_burden, color = Age2)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test3,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,)  +ylab("Germline variant burden")+xlab("Age")+
+  scale_color_manual(values = sm_palette(3))+scale_x_discrete(labels=c("< 18 mo","> 18 mo"))+xlab("Age group")
+
+stat.test4 <- compare_means(
+ germ_rare_burden ~ path_class, data = data_smc,
+ method = "t.test"
+)
+
+Path_figure <- ggplot(data = data_smc %>% filter(!is.na(path_class)), mapping = aes(x = path_class, y = germ_rare_burden, color = path_class)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test4,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,)+ylab("Germline variant burden")+xlab("INPC category")+
+  scale_color_manual(values = sm_palette(3))+scale_x_discrete(labels=c("Favorable",'Unfavorable'))
+
+stat.test5 <- compare_means(
+ germ_rare_burden ~ sex, data = data_smc,
+ method = "t.test"
+)
+
+Sex_figure <- ggplot(data = data_smc, mapping = aes(x = sex, y = germ_rare_burden, color = sex)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test5,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,)+ylab("Germline variant burden")+xlab("Sex")+
+  scale_color_manual(values = sm_palette(3))+scale_x_discrete(labels=c("Female",'Male'))
+
+stat.test6 <- compare_means(
+ germ_rare_burden ~ mycn, data = data_smc,
+ method = "t.test"
+)
+
+Mycn_figure <- ggplot(data = data_smc, mapping = aes(x = mycn, y = germ_rare_burden, color = mycn)) + 
+  sm_boxplot(shape = NA, size = 0)  + stat_pvalue_manual(stat.test6,  label = "P = {scales::pvalue(p.adj)}",y.position = 60,)+ylab("Germline variant burden")+xlab("MYCN status")+
+  scale_color_manual(values = sm_palette(3))+scale_x_discrete(labels=c("Not Amplified",'Amplified'))
+
+
+GVB_all <- cowplot::plot_grid(
+  Risk_figure, 
+  Stage_figure + theme(axis.text.y = element_blank(),
+                       axis.ticks.y = element_blank(),
+                       axis.title.y = element_blank()), 
+  Age_figure + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()), 
+  Path_figure + theme(axis.text.y = element_blank(),
+                      axis.ticks.y = element_blank(),
+                      axis.title.y = element_blank()), 
+  Sex_figure + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()), 
+  Mycn_figure + theme(axis.text.y = element_blank(),
+                      axis.ticks.y = element_blank(),
+                      axis.title.y = element_blank()),
+  ncol = 3
+)
+
+
+pdf(paste0(Figure_dir, "/SMC_Clinic_GVB_box.pdf"), width=10, height=8)
+GVB_all
+dev.off()    
+```
+
+# 11. Survival
+```{r}
+data_smc$germ_burden_group <- factor(data_smc$germ_burden_group, levels = c("Low", "High"))
+
+fit <- survfit(Surv(fu_event_pr, event_pr == "Yes") ~ germ_burden_group, data = data_smc)
+sd <- survdiff(Surv(fu_event_pr, event_pr == "Yes") ~ germ_rare_burden, data = data_smc)
+p_val2 <- round(1 - pchisq(sd$chisq, length(sd$n) - 1), 4)
+
+ggsurv <- ggsurvplot(fit, data = data_smc, break.time.by = 2, 
+                     xlab = "Time(years)", ylab = "Progression-free survival (%)", 
+                     xlim = c(0, 8), conf.int = FALSE, pval = FALSE,
+                     legend.labs = c("Low", "High"),
+                     legend.title = "Germline variant burden of pFGVs",
+                     legend = "right", palette = sm_color("brown", "blue"),
+                     risk.table = TRUE, risk.table.height = 0.2, 
+                     risk.table.fontsize = 5, risk.table.ticks.col = TRUE, 
+                     risk.table.y.text.col = TRUE, tables.y.text = FALSE, size = 1.2,
+                     fontsize = 5, font.main = c(20, "plain"), font.x = c(20),
+                     font.y = c(20), font.legend = c(13))
+
+ggsurv$table <- ggsurv$table + theme_cleantable() + theme(axis.line = element_blank())
+ggsurv$plot <- ggsurv$plot + 
+  theme(plot.title = element_text(size = 30, hjust = -0.1, face = "bold"),
+        axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15),
+        legend.justification = 'left', legend.position = c(0.05, 0.15),
+        legend.direction = 'vertical') + 
+  annotate("text", x = 6.5, y = 0.25, label = bquote('Log rank' ~ italic(P) == .(p_val2)), size = 5)
+
+ggsave(paste0(result_dir, "/SMC_PFS_by_burden_group.pdf"), ggsurv, width = 7, height = 6)
+
+```
+
+# 12. Survival prediction
+## 11-1) Training
+```{r}
+library(survAUC)
+library(rms)
+library(prodlim)
+library(lava)
+library(riskRegression)
+
+fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ risk, data=SMC_clinic, x=T, y=T )
+y <- read.table("smc_clinic_tmp.tsv", row.names=1, header=TRUE, sep="\t")
+
+set.seed(1235)
+iter <- 500
+error_mat <- matrix(NaN, nrow=(iter*6), ncol=2)
+colnames(error_mat) <- c("group", "cindex")
+rownames(error_mat) <- c(1:(iter*6))
+
+j <- 1
+
+for(i in (1:iter)) {
+  
+  # permutation
+  t <- 1:dim(y)[1]
+  inx <- sample(t)
+  
+  x <- y[inx,]
+  
+  TR <- x[1:round(dim(x)[1]*0.60),]
+  TE <- x[(round(dim(x)[1]*0.60)+1):dim(x)[1],]
+  
+  # Clinical
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ Age2+mycn+stage, data=TR, x=T, y=T,)
+  val <- rms::validate( fit, dxy=T, B=200, )
+  c.index1 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat[j,1] <- 1
+  error_mat[j,2] <- c.index1},silent=TRUE)
+  j <- j+1
+  
+  # Germline variant burden
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ germ_burden_group, data=TR, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index2 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat[j,1] <- 2
+  error_mat[j,2] <- c.index2},silent=TRUE)
+  j <- j+1
+  
+  # pFGV in CPGs  
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ CPG, data=TR, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index3 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat[j,1] <- 3
+  error_mat[j,2] <- c.index3},silent=TRUE)
+  j <- j+1
+  
+  # CPG + Germline variant burden
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ germ_burden_group + CPG, data=TR, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index4 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat[j,1] <- 4
+  error_mat[j,2] <- c.index4},silent=TRUE)
+  j <- j+1
+  
+  # Clinical + Germline variant burden + CPG 
+  try({fit <- cph( Surv(fu_event_pr,event_pr=="Yes") ~Age2+mycn+stage + germ_burden_group +CPG, data=TR, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index5 <- 0.5 * ( val[1,1] + 1 )
+  error_mat[j,1] <- 5
+  error_mat[j,2] <- c.index5},silent=TRUE)
+  j <- j+1
+}
+
+write.table(error_mat, file="/path/data/germline/results_final/cindex_500_TR.txt", sep="\t", row.names = TRUE, col.names=TRUE, quote = FALSE)
+```
+
+## 11-2) Testing 
+```{r}
+y <- read.table("smc_clinic_tmp.tsv", row.names=1, header=TRUE, sep="\t")
+
+set.seed(1235)
+iter <- 500
+error_mat_te <- matrix(NaN, nrow=(iter*6), ncol=2)
+colnames(error_mat_te) <- c("group", "cindex")
+rownames(error_mat_te) <- c(1:(iter*6))
+
+j <- 1
+
+for(i in (1:iter)) {
+  
+  # permutation
+  t <- 1:dim(y)[1]
+  inx <- sample(t)
+  
+  x <- y[inx,]
+  
+  TR <- x[1:round(dim(x)[1]*0.60),]
+  TE <- x[(round(dim(x)[1]*0.60)+1):dim(x)[1],]
+  
+  # Clinical
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ Age2+mycn+stage, data=TE, x=T, y=T,)
+  val <- rms::validate( fit, dxy=T, B=200, )
+  c.index1 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat_te[j,1] <- 1
+  error_mat_te[j,2] <- c.index1},silent=TRUE)
+  j <- j+1
+  
+  # Germline variant burden
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ germ_burden_group, data=TE, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index2 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat_te[j,1] <- 2
+  error_mat_te[j,2] <- c.index2},silent=TRUE)
+  j <- j+1
+  
+  # pFGV in CPGs  
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ CPG, data=TE, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index3 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat_te[j,1] <- 3
+  error_mat_te[j,2] <- c.index3},silent=TRUE)
+  j <- j+1
+  
+  # CPG + Germline variant burden
+  try({fit <- rms::cph( Surv(fu_event_pr,event_pr=="Yes") ~ germ_burden_group + CPG, data=TE, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index4 <- 0.5 * ( val[1,1] + 1 ) 
+  error_mat_te[j,1] <- 4
+  error_mat_te[j,2] <- c.index4},silent=TRUE)
+  j <- j+1
+  
+  # Clinical + Germline variant burden + CPG 
+  try({fit <- cph( Surv(fu_event_pr,event_pr=="Yes") ~Age2+mycn+stage + germ_burden_group +CPG, data=TE, x=T, y=T )
+  val <- rms::validate( fit, dxy=T, B=200 )
+  c.index5 <- 0.5 * ( val[1,1] + 1 )
+  error_mat_te[j,1] <- 5
+  error_mat_te[j,2] <- c.index5},silent=TRUE)
+  j <- j+1
+}
+
+write.table(error_mat_te, file="/path/data/germline/results_final/cindex_500_TE.txt", sep="\t", row.names = TRUE, col.names=TRUE, quote = FALSE)
+```
+
+
+
+# 13. TCGA vs. TARGET GVB
+
+```{r}
+library(tidyverse)
+library(broom) 
+
+TARGET_clinic_white_race <- TARGET_clinic %>% filter(Race == "White")
+TARGET_tmp <- TARGET_clinic_white_race %>% select(Tumor_Sample_Barcode, CPG,germ_rare_burden) %>% 
+  mutate(Age_group = "TARGET")
+TCGA_tmp <- TCGA_subtype_solid_white %>% select(Tumor_Sample_Barcode, CPG, Age_group,germ_rare_burden)
+
+# Data Preparation for Plotting
+All_age <- rbind(TCGA_tmp, TARGET_white_tmp) %>%
+  mutate(Age_group = factor(Age_group, levels = c("TARGET-NBL", "Under 30", "30s", "40s", "50s", "60s", "70s", "Over 80"),labels = c("<18", "19-29", "30-39", "40-49", "50-59", "60-69", "70-79", "Over 80")))
+
+# Calculating Spearman Coefficient for each Age Group
+coeff_age <- All_age %>% 
+  group_by(Age_group) %>% 
+  summarize(correlation = cor(germ_rare_burden, TMB, method = "spearman"))
+
+# Plotting
+spearman_trend <- ggplot(coeff_age, aes(x = Age_group, y = correlation)) +
+  geom_point() +
+  geom_line() +
+  ylab("Spearman's coefficient") +
+  xlab("") +
+  theme_minimal() +
+
+print(spearman_trend)
+
+```
+
+
+# 14. TCGA vs. TARGET CPG
+```{r}
+library(janitor)
+
+All_white <- rbind(TARGET_tmp, TCGA_tmp) %>%
+  mutate(Age_group = factor(Age_group, levels = c("TARGET", "Under 30", "30s", "40s", "50s", "60s", "70s", "Over 80")),
+         CPG = factor(CPG, levels = c("Yes", "No")))
+
+# Proportion tests
+count_table <- All_white %>% tabyl(Age_group, CPG) %>% adorn_totals("col") %>% as.data.frame()
+prop.test(count_table$Yes, count_table$Total)
+prop.trend.test(count_table$Yes, count_table$Total)
+
+# Frequency table and plot preparation
+freq_table <- All_white %>% tabyl(Age_group, CPG) %>% adorn_percentages()
+example.melt <- melt(freq_table, id.vars = "Age_group")
+example.melt <- example.melt %>% 
+  mutate(variable = factor(variable, levels = c("No", "Yes")),
+         Age_group = factor(Age_group, levels = c("TARGET", "Under 30", "30s", "40s", "50s", "60s", "70s", "Over 80"),
+                           labels = c("TARGET", "19-29", "30-39", "40-49", "50-59", "60-69", "70-79", "Over 80")))
+
+# Plotting
+cpg_prevalent <- ggplot(example.melt, aes(x = Age_group, y = value, fill = variable)) +
+  geom_bar(position = "fill", stat = "identity", color = 'black', width = 0.9) +
+  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = paste0(round(value * 100, 2), "%")), 
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = c("#d3d3d3", "#1262b3")) +
+  labs(x = "Age group", y = "Percent", fill = "pFGVs in CPGs") +
+  theme_minimal() +
+  annotate("text", x = 6.5, y = 1.05, label = expression('Cochran-Armitage Trend Test' ~ italic(P) ~ '< 0.001'), size = 3)
+
+# Saving the plot
+ggsave(paste0(Figure_dir, "/CPG_across_age.pdf"), cpg_prevalent, width = 8, height = 4)
+
+```
+
