@@ -199,7 +199,7 @@ infor <-left_join(infor,TMB_total,by="Tumor_Sample_Barcode")
 infor <-left_join(infor,gvb,by="germline_id")
 infor$TMB_log <- log10(infor$TMB)
 
-infor$germ_burden_group <- ifelse(infor$germ_rare_burden>=41,"High","Low")
+infor$germ_burden_group <- ifelse(infor$germ_rare_burden>=45,"High","Low")
 cor.test(infor$germ_rare_burden,infor$TMB_log,method = 'spearman') # P = 0.018 : #Fig.1d
 t.test(infor$TMB~infor$germ_burden_group) # 
 
