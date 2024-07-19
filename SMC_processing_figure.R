@@ -345,7 +345,7 @@ res <- lm(SMC_data$TMB_log~SMC_data$germ_rare_burden+SMC_data$Germline_Coverage+
 
 # 9. Survival ---------------------------------------------------------------------------------
 
-summary(SMC_data$germ_rare_burden) #Mean 41.5 -> round down (d/t >=42 , high group too low) & Median also 41 
+summary(SMC_data$germ_rare_burden) #Mean 41 & Median also 41 
 SMC_data <- SMC_data %>% mutate(germ_burden_group=ifelse(germ_rare_burden>=41,"High","Low"))
 
 SMC_data$germ_burden_group<-factor(SMC_data$germ_burden_group,levels=c("Low","High"))
