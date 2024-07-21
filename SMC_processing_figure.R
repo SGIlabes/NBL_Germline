@@ -69,8 +69,8 @@ for (i in 1:filecnt) {
   )
   
   inner3 <- binded1 %>% filter(
-    REVEL >= 0.7 | str_detect(CLNDSDBID, "Pathogenic") | 
-      str_detect(CLNDSDBID, "Likely")
+    REVEL >= 0.7 | str_detect(CLNSIG, "Pathogenic") | 
+      str_detect(CLNSIG, "Likely")
   )
   
   # Combine inner2 and inner3
@@ -78,11 +78,11 @@ for (i in 1:filecnt) {
   
   # Filter out benign annotations
   inner_all <- inner_all %>% filter(
-    !str_detect(CLNDSDBID, "benign") | is.na(CLNDSDBID)
+    !str_detect(CLNSIG, "benign") | is.na(CLNDSDBID)
   )
   
   inner_all <- inner_all %>% filter(
-    !str_detect(CLNDSDBID, "Benign") | is.na(CLNDSDBID)
+    !str_detect(CLNSIG, "Benign") | is.na(CLNDSDBID)
   )
   
   # Append to raw_variant
